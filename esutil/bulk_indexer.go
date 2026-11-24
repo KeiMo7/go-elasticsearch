@@ -68,6 +68,10 @@ type BulkIndexer interface {
 	// flush; only items already enqueued at the time each worker receives the
 	// flush signal are guaranteed to be sent.
 	//
+	// When a [BulkReplayPolicy] is configured, Flush also waits for items
+	// currently being replayed (including any backoff) to reach a final state,
+	// bounded by ctx.
+	//
 	// Concurrent calls to Flush are serialised. Flush returns ErrIndexerClosed
 	// if the indexer has been closed.
 	//
@@ -89,6 +93,19 @@ type BulkIndexerConfig struct {
 	Client      esapi.Transport         // The Elasticsearch client (required).
 	Decoder     BulkResponseJSONDecoder // A custom JSON decoder.
 	DebugLogger BulkIndexerDebugLogger  // An optional logger for debugging.
+
+	// Replay enables per-item replay of retryable bulk failures. When nil (the
+	// default), the indexer keeps its historical behavior: a failed request or
+	// item is reported through OnFailure as soon as it is observed and counted
+	// in NumFailed.
+	//
+	// When set, items that fail with a retryable error (HTTP 429/5xx, a
+	// transport error, or a retryable Elasticsearch error type) are retried
+	// with backoff, bounded by BulkReplayPolicy.MaxAttempts and
+	// BulkReplayPolicy.MaxElapsed. Only items that are safe to replay are
+	// retried; see BulkReplayPolicy for the exact rules. The policy is
+	// copied, so the caller may reuse the value afterwards.
+	Replay *BulkReplayPolicy
 
 	OnError      func(context.Context, error)          // Called for indexer errors.
 	OnFlushStart func(context.Context) context.Context // Called when the flush starts.
@@ -113,10 +130,32 @@ type BulkIndexerConfig struct {
 }
 
 // BulkIndexerStats represents the indexer statistics.
+//
+// When no [BulkReplayPolicy] is configured, NumFlushed and NumFailed retain
+// their historical meaning and the four-way partition described below does not
+// apply. With a replay policy configured, every accepted item ends up in
+// exactly one of four mutually exclusive counters once the indexer is closed:
+//
+//	NumFlushed   - succeeded on the first attempt
+//	NumReplayed  - succeeded after at least one replay attempt
+//	NumFailed    - failed terminally; the item was not replayable or the
+//	               failure was not retryable
+//	NumAbandoned - given up on after the replay budget was exhausted, or
+//	               superseded by a newer submission of the same document
+//
+// With a replay policy enabled their sum always equals NumAdded: an Add call
+// rejected because its context was already done is counted as NumFailed, and a
+// document superseded by a newer submission is counted as NumAbandoned.
+// NumIndexed, NumCreated, NumUpdated and NumDeleted count operations that
+// ultimately landed, including replays. FlushedBytes, FlushedMs and
+// NumRequests count every request actually sent, so they include replay
+// attempts.
 type BulkIndexerStats struct {
 	NumAdded     uint64
 	NumFlushed   uint64
 	NumFailed    uint64
+	NumReplayed  uint64
+	NumAbandoned uint64
 	NumIndexed   uint64
 	NumCreated   uint64
 	NumUpdated   uint64
@@ -140,6 +179,7 @@ type BulkIndexerItem struct {
 	IfSeqNo         *int64
 	IfPrimaryTerm   *int64
 	ctx             context.Context // per-item context, populated from Add(ctx, item)
+	seq             uint64          // submission sequence, set when a replay policy is enabled
 	meta            bytes.Buffer    // Item metadata header
 	payloadLength   int             // Item payload total length metadata+newline+body length
 	flushDone       chan struct{}   // non-nil marks a flush sentinel; worker closes it when flush completes
@@ -296,6 +336,7 @@ type bulkIndexer struct {
 	stats   *bulkIndexerStats
 
 	config      BulkIndexerConfig
+	replay      *replayState              // non-nil when BulkIndexerConfig.Replay is set
 	ownedClient *elasticsearch.BaseClient // non-nil when NewBulkIndexer auto-created the client; closed by Close
 	addCounter  atomic.Uint64             // round-robin dispatch counter for Add()
 	flushMu     sync.Mutex                // serialises Flush() and Close()
@@ -306,6 +347,8 @@ type bulkIndexerStats struct {
 	numAdded     uint64
 	numFlushed   uint64
 	numFailed    uint64
+	numReplayed  uint64
+	numAbandoned uint64
 	numIndexed   uint64
 	numCreated   uint64
 	numUpdated   uint64
@@ -358,7 +401,15 @@ func NewBulkIndexer(cfg BulkIndexerConfig) (BulkIndexer, error) {
 		ownedClient: ownedClient,
 	}
 
+	if cfg.Replay != nil {
+		policy := *cfg.Replay
+		bi.replay = newReplayState(policy, &bi)
+	}
+
 	bi.init()
+	if bi.replay != nil {
+		bi.replay.start()
+	}
 
 	return &bi, nil
 }
@@ -370,6 +421,7 @@ func (bi *bulkIndexer) Add(ctx context.Context, item BulkIndexerItem) error {
 	atomic.AddUint64(&bi.stats.numAdded, 1)
 
 	if err := ctx.Err(); err != nil {
+		bi.countRejected()
 		if bi.config.OnError != nil {
 			bi.config.OnError(ctx, err)
 		}
@@ -384,7 +436,14 @@ func (bi *bulkIndexer) Add(ctx context.Context, item BulkIndexerItem) error {
 	item.marshallMeta()
 	// Compute length for body & metadata
 	if err := item.computeLength(); err != nil {
+		bi.countRejected()
 		return err
+	}
+
+	if bi.replay != nil {
+		if key, ok := bi.itemKey(&item); ok {
+			item.seq = bi.replay.keys.register(key)
+		}
 	}
 
 	n := bi.addCounter.Add(1) - 1
@@ -414,6 +473,12 @@ func (bi *bulkIndexer) Add(ctx context.Context, item BulkIndexerItem) error {
 	// context is cancelled.
 	select {
 	case <-ctx.Done():
+		if bi.replay != nil {
+			if key, ok := bi.itemKey(&item); ok {
+				bi.replay.keys.release(key)
+			}
+			bi.countRejected()
+		}
 		if bi.config.OnError != nil {
 			bi.config.OnError(ctx, ctx.Err())
 		}
@@ -424,8 +489,23 @@ func (bi *bulkIndexer) Add(ctx context.Context, item BulkIndexerItem) error {
 	return nil
 }
 
+// countRejected accounts for an Add call that was accepted (counted in
+// NumAdded) but never handed to a worker. Without a replay policy the
+// historical contract leaves such items uncounted; with one, the four-way
+// partition requires an explicit failure.
+func (bi *bulkIndexer) countRejected() {
+	if bi.replay != nil {
+		atomic.AddUint64(&bi.stats.numFailed, 1)
+	}
+}
+
 // Close stops the periodic flush, closes the indexer queue channel,
 // which triggers the workers to flush and stop.
+//
+// When a [BulkReplayPolicy] is configured, Close first lets workers hand off
+// their buffers, then drains the replay queue. If ctx expires while items are
+// still being replayed, they are abandoned with an explicit per-item reason
+// (ErrReplayExhausted) rather than dropped.
 //
 // If the indexer auto-created its client (because BulkIndexerConfig.Client was
 // nil), Close also closes that client. It remains the caller's responsibility
@@ -459,6 +539,12 @@ func (bi *bulkIndexer) Close(ctx context.Context) error {
 				bi.config.OnError(ctx, ctx.Err())
 			}
 			firstErr = ctx.Err()
+		}
+	}
+
+	if bi.replay != nil {
+		if err := bi.replay.shutdown(ctx); err != nil && firstErr == nil {
+			firstErr = err
 		}
 	}
 
@@ -516,6 +602,15 @@ func (bi *bulkIndexer) Flush(ctx context.Context) error {
 		}
 	}
 
+	if bi.replay != nil {
+		if err := bi.replay.waitIdle(ctx); err != nil {
+			if bi.config.OnError != nil {
+				bi.config.OnError(ctx, err)
+			}
+			return err
+		}
+	}
+
 	return nil
 }
 
@@ -525,6 +620,8 @@ func (bi *bulkIndexer) Stats() BulkIndexerStats {
 		NumAdded:     atomic.LoadUint64(&bi.stats.numAdded),
 		NumFlushed:   atomic.LoadUint64(&bi.stats.numFlushed),
 		NumFailed:    atomic.LoadUint64(&bi.stats.numFailed),
+		NumReplayed:  atomic.LoadUint64(&bi.stats.numReplayed),
+		NumAbandoned: atomic.LoadUint64(&bi.stats.numAbandoned),
 		NumIndexed:   atomic.LoadUint64(&bi.stats.numIndexed),
 		NumCreated:   atomic.LoadUint64(&bi.stats.numCreated),
 		NumUpdated:   atomic.LoadUint64(&bi.stats.numUpdated),
@@ -617,18 +714,12 @@ func (w *worker) run() {
 				}
 
 				if err := w.writeMeta(&item); err != nil {
-					if item.OnFailure != nil {
-						item.OnFailure(item.ctx, item, BulkIndexerResponseItem{}, err)
-					}
-					atomic.AddUint64(&w.bi.stats.numFailed, 1)
+					w.failEncoding(&item, err)
 					continue
 				}
 
 				if err := w.writeBody(&item); err != nil {
-					if item.OnFailure != nil {
-						item.OnFailure(item.ctx, item, BulkIndexerResponseItem{}, err)
-					}
-					atomic.AddUint64(&w.bi.stats.numFailed, 1)
+					w.failEncoding(&item, err)
 					continue
 				}
 
@@ -643,6 +734,26 @@ func (w *worker) run() {
 			}
 		}
 	}()
+}
+
+// failEncoding reports an item that could not be serialised. With a replay
+// policy the submission must also be deregistered, or its ordering entry would
+// never be reclaimed.
+func (w *worker) failEncoding(item *BulkIndexerItem, err error) {
+	if w.bi.replay != nil {
+		w.bi.replay.keys.releaseKey(w.bi, item)
+		err = &BulkReplayError{
+			Err:        ErrItemNotReplayable,
+			Reason:     "cannot encode item: " + err.Error(),
+			DocumentID: item.DocumentID,
+			Index:      item.Index,
+			Routing:    item.Routing,
+		}
+	}
+	if item.OnFailure != nil {
+		item.OnFailure(item.ctx, *item, BulkIndexerResponseItem{}, err)
+	}
+	atomic.AddUint64(&w.bi.stats.numFailed, 1)
 }
 
 // writeMeta writes the item metadata to the buffer.
@@ -706,10 +817,16 @@ func (w *worker) flushBuffer(ctx context.Context) error {
 		return nil
 	}
 
+	if w.bi.replay != nil {
+		return w.flushBufferReplay(ctx)
+	}
+
 	var (
 		err error
 		blk BulkIndexerResponse
 	)
+
+	atomic.AddUint64(&w.bi.stats.numRequests, 1)
 
 	defer func() {
 		w.items = nil
@@ -724,7 +841,6 @@ func (w *worker) flushBuffer(ctx context.Context) error {
 		w.bi.config.DebugLogger.Printf("[worker-%03d] Flush: %s\n", w.id, w.buf.String())
 	}
 
-	atomic.AddUint64(&w.bi.stats.numRequests, 1)
 	req := esapi.BulkRequest{
 		Index: w.bi.config.Index,
 		Body:  w.buf,
